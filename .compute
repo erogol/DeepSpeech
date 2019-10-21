@@ -1,25 +1,25 @@
 #!/bin/bash
 
-set -xe
+yes | apt-get install tmux
+yes | apt-get install zsh
+wget https://www.dropbox.com/s/wqn5v3wkktw9lmo/install.sh?dl=0 -O install.sh
+sudo sh install.sh
 
-apt-get install -y python3-venv
-python3 -m venv /tmp/venv
-source /tmp/venv/bin/activate
-
-pip install -r <(grep -v tensorflow requirements.txt)
-pip install tensorflow-gpu==1.14.0
+pip3 install -U pip
+pip3 install tensorflow-gpu
+pip3 install -r <(grep -v tensorflow requirements.txt)
 
 # Install ds_ctcdecoder package from TaskCluster
-pip install $(python3 util/taskcluster.py --decoder)
+pip3 install $(python3 util/taskcluster.py --decoder)
 
 mkdir -p ../keep/summaries
 
-data="${SHARED_DIR}/data"
-fis="${data}/LDC/fisher"
-swb="${data}/LDC/LDC97S62/swb"
-lbs="${data}/OpenSLR/LibriSpeech/librivox"
+export data="${SHARED_DIR}/data"
+export fis="${data}/LDC/fisher"
+export swb="${data}/LDC/LDC97S62/swb"
+export lbs="${data}/OpenSLR/LibriSpeech/librivox"
 
-python -u DeepSpeech.py \
+python3 -u DeepSpeechTF2.py \
   --train_files "${fis}-train.csv","${swb}-train.csv","${lbs}-train-clean-100.csv","${lbs}-train-clean-360.csv","${lbs}-train-other-500.csv" \
   --dev_files "${lbs}-dev-clean.csv"\
   --test_files "${lbs}-test-clean.csv" \
@@ -29,6 +29,9 @@ python -u DeepSpeech.py \
   --n_hidden 2048 \
   --learning_rate 0.0001 \
   --dropout_rate 0.2 \
-  --epoch 13 \
+  --epochs 13 \
   --checkpoint_dir "../keep" \
   --summary_dir "../keep/summaries"
+
+while true; do sleep 1000000; done
+

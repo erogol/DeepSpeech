@@ -90,9 +90,22 @@ class DeepSpeech(keras.Model):
 
 def main(_):
     use_cuda = tf.test.is_gpu_available()
-    num_gpus = len(tf.config.experimental.list_physical_devices('GPU'))
+    gpus = tf.config.experimental.list_physical_devices('GPU')
+    num_gpus = len(gpus)
     print("Using CUDA: ", use_cuda)
     print("Number of GPUs: ", num_gpus)
+
+    # try:
+    #     tf.config.experimental.set_virtual_device_configuration(
+    #         gpus[0],
+    #         [tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4048),
+    #         tf.config.experimental.VirtualDeviceConfiguration(memory_limit=4048)])
+    #     logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+    #     print(len(gpus), "Physical GPU,", len(logical_gpus), "Logical GPUs")
+    # except RuntimeError as e:
+    #     # Virtual devices must be set before GPUs have been initialized
+    #     print(e)
+
 
     initialize_globals()
     train_set = create_dataset(FLAGS.train_files.split(','),
@@ -125,7 +138,7 @@ def main(_):
 
     # for epoch in range(FLAGS.epochs):
     #     for step, data in enumerate(train_set.take(4)):
-    #         start_time = time.time()
+    #         start_time = time.time()w
     #         loss = train_step(model, data)
     #         step_time = time.time() - start_time
     #         print('Epoch {:>3} - Step {:>3} - Training loss: {:.3f} - Step Time: {:.2f}'.format(epoch, int(step), float(loss), step_time))
@@ -139,11 +152,18 @@ def main(_):
     BATCH_SIZE_PER_REPLICA = FLAGS.train_batch_size
     GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
 
+    # create training set
     train_set = create_dataset(FLAGS.train_files.split(','),
                                batch_size=GLOBAL_BATCH_SIZE,
                                cache_path=FLAGS.feature_cache)
-
     train_set_dist = strategy.experimental_distribute_dataset(train_set)
+
+    # create development set
+    if FLAGS.dev_files:
+        dev_csvs = FLAGS.dev_files.split(',')
+        dev_set = create_dataset(dev_csvs, batch_size=FLAGS.dev_batch_size)
+        dev_set_dist = strategy.experimental_distribute_dataset(dev_set)
+
 
     with strategy.scope():
         # loss
@@ -157,14 +177,14 @@ def main(_):
             return tf.nn.compute_average_loss(per_example_loss, global_batch_size=GLOBAL_BATCH_SIZE)
 
         # metrics
-        train_loss = tf.keras.metrics.Mean(name='train_loss')
+        # train_loss = tf.keras.metrics.Mean(name='train_loss')
 
         # primitives
         optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate)
         model = DeepSpeech(Config, FLAGS)
 
-        def train_step(inputs):
-            batch_x, batch_x_lens, batch_y, batch_y_lens = data
+        def train_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
+            # batch_x, batch_x_lens, batch_y, batch_y_lens = data
             with tf.GradientTape() as tape:
                 logits = model(batch_x)
 
@@ -177,25 +197,53 @@ def main(_):
             grads = tape.gradient(loss, model.trainable_variables)
             optimizer.apply_gradients(zip(grads, model.trainable_variables))
             return loss 
+        
+        def eval_step(inputs):
+            batch_x, batch_x_lens, batch_y, batch_y_lens = data
+            logits = model(batch_x)
+            loss = compute_loss(batch_y,
+                                batch_y_lens,
+                                logits,
+                                batch_x_lens,
+                                Config,
+                                )
+            return loss 
 
         @tf.function
-        def distributed_train_step(dataset_inputs):
+        def distributed_train_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
             per_replica_losses = strategy.experimental_run_v2(train_step,
-                                                            args=(dataset_inputs,))
+                                                            args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
             return strategy.reduce(tf.distribute.ReduceOp.SUM, per_replica_losses,
                                 axis=None)
-        
-        # @tf.function
-        # def distributed_test_step(dataset_inputs):
-        #     return strategy.experimental_run_v2(test_step, args=(dataset_inputs,))
 
+        @tf.function
+        def distributed_test_step(dataset_inputs):
+            return strategy.experimental_run_v2(eval_step, args=(dataset_inputs,))
+        
         for epoch in range(FLAGS.epochs):
             # TRAIN LOOP
-            for step, data in enumerate(train_set_dist):
+            total_train_loss = 0.
+            step = 0.0
+            for data in train_set_dist:
                 start_time = time.time()
-                loss = distributed_train_step(data)
+                batch_x, batch_x_lens, batch_y, batch_y_lens = data
+                loss = distributed_train_step(batch_x, batch_x_lens, batch_y, batch_y_lens)
                 step_time = time.time() - start_time
-                print('Epoch {:>3} - Step {:>3} - Training loss: {:.3f} - Step Time: {:.2f}'.format(epoch, int(step), float(loss), step_time))
+                step += 1
+                print('Epoch {:>3} - Step {:>3} - Loss: {:.3f} - Step Time: {:.2f}'.format(epoch, int(step), float(loss), step_time))
+            avg_train_loss = total_train_loss / step 
+
+            # EVAL LOOP
+            if FLAGS.dev_files:
+                total_eval_loss = 0.0
+                step = 0.0
+                for step, data in enumerate(dev_set_dist):
+                    eval_loss = distributed_test_step(data)
+                    total_eval_loss += eval_loss
+                    step += 1
+                avg_eval_loss = total_eval_loss / step
+                print('Avg. Eval Loss: {:.3f} - Avg. Train Loss: {:.3f}'.format(avg_eval_loss, avg_train_loss))
+
 
 
 if __name__ == '__main__':

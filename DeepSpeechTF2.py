@@ -159,7 +159,7 @@ def main(_):
                 train_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
             final_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN,
                                 per_example_losses,
-                                axis=None)
+                                axis=0)
             avg_train_loss(final_loss)
             return final_loss
 
@@ -179,7 +179,7 @@ def main(_):
             per_example_losses = strategy.experimental_run_v2(eval_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
             final_eval_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN,
                                 per_example_losses,
-                                axis=None)
+                                axis=0)
             avg_eval_loss(final_eval_loss)
             return final_eval_loss
 

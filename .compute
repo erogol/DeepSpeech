@@ -14,7 +14,7 @@ pip3 install $(python3 util/taskcluster.py --decoder)
 
 mkdir -p ../keep/summaries
 
-export data="${SHARED_DIR}/data"
+export data="/data/ro/shared/data"
 export fis="${data}/LDC/fisher"
 export swb="${data}/LDC/LDC97S62/swb"
 export lbs="${data}/OpenSLR/LibriSpeech/librivox"

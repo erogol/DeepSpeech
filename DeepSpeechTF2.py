@@ -28,7 +28,8 @@ class DenseDropout(keras.layers.Layer):
         self.dropout = keras.layers.Dropout(dropout_rate)
 
     def call(self, x):
-        return self.dropout(keras.activations.relu(self.layer(x), max_value=self.relu_clip))
+        return self.dropout(
+            keras.activations.relu(self.layer(x), max_value=self.relu_clip))
 
 
 class CreateOverlappingWindows(tf.keras.Model):
@@ -36,33 +37,67 @@ class CreateOverlappingWindows(tf.keras.Model):
         super(CreateOverlappingWindows, self).__init__()
         window_width = 2 * Config.n_context + 1
         num_channels = Config.n_input
-        identity = (np.eye(window_width * num_channels)
-                        .reshape(window_width, num_channels, window_width * num_channels))
+        identity = (np.eye(window_width * num_channels).reshape(
+            window_width, num_channels, window_width * num_channels))
         self.identity_filter = tf.constant(identity, tf.float32)
         self.reshape = layers.Reshape((-1, window_width * num_channels))
 
     def call(self, x):
-        x = tf.nn.conv1d(input=x, filters=self.identity_filter, stride=1, padding='SAME')
-        return x
+        x = tf.nn.conv1d(input=x,
+                         filters=self.identity_filter,
+                         stride=1,
+                         padding='SAME')
+        return self.reshape(x)
+
+# def create_model():
+#     inputs = tf.keras.Input(shape=(None, None, Config.n_input))
+
+#     x = CreateOverlappingWindows()(inputs)
+#     x = layers.Masking()(x)
+
+#     x = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
+#     x = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2, FLAGS.relu_clip)(x)
+#     x = DenseDropout(Config.n_hidden_3, FLAGS.dropout_rate3, FLAGS.relu_clip)(x)
+#     # cudnn enabling setting for LSTM
+#     x = keras.layers.LSTM(Config.n_cell_dim, activation='tanh', recurrent_activation='sigmoid', recurrent_dropout=0.0, unroll=False, use_bias=True, return_sequences=True)(x)
+
+#     x = DenseDropout(Config.n_hidden_5, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
+#     x = layers.Dense(Config.n_hidden_6)(x)
+#     return tf.keras.Model(inputs=inputs, outputs=x, name='DeepSpeechModel')
 
 
-def create_model():
-    inputs = tf.keras.Input(shape=(None, Config.n_input))
+class DeepSpeech(keras.Model):
+    def __init__(self):
+        super(DeepSpeech, self).__init__()
+        self.overlap_layer = CreateOverlappingWindows()
+        self.masking = layers.Masking()
+        self.dense1 = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate,
+                                   FLAGS.relu_clip)
+        self.dense2 = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2,
+                                   FLAGS.relu_clip)
+        self.dense3 = DenseDropout(Config.n_hidden_3, FLAGS.dropout_rate3,
+                                   FLAGS.relu_clip)
+        self.rnn = keras.layers.LSTM(Config.n_cell_dim,
+                                     activation='tanh',
+                                     recurrent_activation='sigmoid',
+                                     recurrent_dropout=0.0,
+                                     unroll=False,
+                                     use_bias=True,
+                                     return_sequences=True)
+        self.dense5 = DenseDropout(Config.n_hidden_5, FLAGS.dropout_rate,
+                                   FLAGS.relu_clip)
+        self.dense_out = layers.Dense(Config.n_hidden_6)
 
-    x = CreateOverlappingWindows()(inputs)
-    x = layers.Masking()(x)
-
-    clipped_relu = partial(tf.keras.activations.relu, max_value=FLAGS.relu_clip)
-
-    x = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
-    x = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2, FLAGS.relu_clip)(x)
-    x = DenseDropout(Config.n_hidden_3, FLAGS.dropout_rate3, FLAGS.relu_clip)(x)
-    # cudnn enabling setting for LSTM
-    x = keras.layers.LSTM(Config.n_cell_dim, activation='tanh', recurrent_activation='sigmoid', recurrent_dropout=0.0, unroll=False, use_bias=True, return_sequences=True)(x)
-
-    x = DenseDropout(Config.n_hidden_5, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
-    x = layers.Dense(Config.n_hidden_6)(x)
-    return tf.keras.Model(inputs=inputs, outputs=x, name='DeepSpeechModel')
+    @tf.function(input_signature=(tf.TensorSpec([None, None, None], dtype=tf.float32), ))
+    def call(self, x):
+        x = self.overlap_layer(x)
+        x = self.masking(x)
+        x = self.dense1(x)
+        x = self.dense2(x)
+        x = self.dense3(x)
+        x = self.rnn(x)
+        x = self.dense5(x)
+        return self.dense_out(x)
 
 
 def main(_):
@@ -102,7 +137,7 @@ def main(_):
     #     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     #     return loss
 
-    # for epoch in range(FLAGS.epochs):
+    # for epoch in range(FLAGS.epochs):c
     #     for step, data in enumerate(train_set.take(4)):
     #         start_time = time.time()
     #         loss = train_step(model, data)
@@ -112,8 +147,8 @@ def main(_):
     #########################
     # DISTRIBUTED
     #########################
-    strategy = tf.distribute.MirroredStrategy()
-    print ('Number of devices in use: {}'.format(strategy.num_replicas_in_sync))
+    strategy = tf.distribute.MirroredStrategy()  #devices=["/gpu:0", "/gpu:1"])
+    print('Number of devices in use: {}'.format(strategy.num_replicas_in_sync))
     BATCH_SIZE_PER_REPLICA = FLAGS.train_batch_size
     GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
 
@@ -131,75 +166,111 @@ def main(_):
 
     with strategy.scope():
         # primitives
-        # model = DeepSpeech(Config, FLAGS)
-        model = create_model()
+        model = DeepSpeech()
+        # model = create_model()
         optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate)
+
+        # create checkpoint path
+        checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train', 'checkpoint')
+        ckpt = tf.train.Checkpoint(model=model,
+                                   optimizer=optimizer)
+        ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path)
+        best_checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train', 'best')
+        best_ckpt = tf.train.Checkpoint(model=model,
+                                   optimizer=optimizer)
+        best_ckpt_manager = tf.train.CheckpointManager(best_ckpt, best_checkpoint_path, max_to_keep=1)
+
+
+        # if a checkpoint exists, restore the latest checkpoint.
+        # ckpt.restore(ckpt_manager.latest_checkpoint)
+        # print ('Latest checkpoint restored!!')
+
         # metrics
         avg_train_loss = keras.metrics.Mean(name='avg_train_loss')
         avg_eval_loss = keras.metrics.Mean(name='avg_eval_loss')
 
-        @tf.function
-        def distributed_train_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
+        # https://github.com/tensorflow/tensorflow/issues/29911
+        # @tf.function
+        def distributed_train_step(batch_x, batch_x_lens, batch_y,
+                                   batch_y_lens):
             def train_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
                 with tf.GradientTape() as tape:
                     logits = model(batch_x, training=True)
-                    ctc_loss = tf.nn.ctc_loss(
-                        labels=batch_y,
-                        label_length=batch_y_lens,
-                        logits=logits,
-                        logit_length=batch_x_lens,
-                        blank_index=Config.n_hidden_6 - 1,
-                        logits_time_major=False)
-                    loss = tf.reduce_sum(ctc_loss) * (1.0 / GLOBAL_BATCH_SIZE)
+                    ctc_loss = tf.nn.ctc_loss(labels=batch_y,
+                                              label_length=batch_y_lens,
+                                              logits=logits,
+                                              logit_length=batch_x_lens,
+                                              blank_index=Config.n_hidden_6 -
+                                              1,
+                                              logits_time_major=False)
+                    loss = tf.nn.compute_average_loss(
+                        ctc_loss, global_batch_size=GLOBAL_BATCH_SIZE)
                 grads = tape.gradient(loss, model.trainable_variables)
-                optimizer.apply_gradients(
-                    zip(grads, model.trainable_variables))
-                return ctc_loss
-            per_example_losses = strategy.experimental_run_v2(
-                train_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
-            final_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN,
-                                per_example_losses,
-                                axis=0)
+                optimizer.apply_gradients(zip(grads,
+                                              model.trainable_variables))
+                return loss
+
+            per_replica_loss = strategy.experimental_run_v2(
+                train_step,
+                args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
+            final_loss = strategy.reduce(tf.distribute.ReduceOp.SUM,
+                                         per_replica_loss,
+                                         axis=None)
             avg_train_loss(final_loss)
             return final_loss
 
-        @tf.function
-        def distributed_test_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
+        # https://github.com/tensorflow/tensorflow/issues/29911
+        # @tf.function
+        def distributed_test_step(batch_x, batch_x_lens, batch_y,
+                                  batch_y_lens):
             def eval_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
                 logits = model(batch_x, training=False)
-                ctc_loss = tf.nn.ctc_loss(
-                        labels=batch_y,
-                        label_length=batch_y_lens,
-                        logits=logits,
-                        logit_length=batch_x_lens,
-                        blank_index=Config.n_hidden_6 - 1,
-                        logits_time_major=False)
-                # eval_loss = tf.reduce_sum(ctc_loss) * (1.0 / GLOBAL_BATCH_SIZE)
-                return ctc_loss
-            per_example_losses = strategy.experimental_run_v2(eval_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
-            final_eval_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN,
-                                per_example_losses,
-                                axis=0)
+                ctc_loss = tf.nn.ctc_loss(labels=batch_y,
+                                          label_length=batch_y_lens,
+                                          logits=logits,
+                                          logit_length=batch_x_lens,
+                                          blank_index=Config.n_hidden_6 - 1,
+                                          logits_time_major=False)
+                loss = tf.nn.compute_average_loss(
+                    ctc_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+                return loss
+
+            per_replica_loss = strategy.experimental_run_v2(
+                eval_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
+            final_eval_loss = strategy.reduce(tf.distribute.ReduceOp.SUM,
+                                              per_replica_loss,
+                                              axis=None)
             avg_eval_loss(final_eval_loss)
             return final_eval_loss
 
-
     with strategy.scope():
+        best_eval_loss = float('Inf')
         for epoch in range(FLAGS.epochs):
             # TRAIN LOOP
+            loader_time = 0
             for step, data in enumerate(train_set_dist):
+                loader_time = time.time() - loader_time
                 start_time = time.time()
                 batch_x, batch_x_lens, batch_y, batch_y_lens = data
-                loss = distributed_train_step(batch_x, batch_x_lens, batch_y, batch_y_lens)
+                loss = distributed_train_step(batch_x, batch_x_lens, batch_y,
+                                              batch_y_lens)
                 step_time = time.time() - start_time
-                print('Epoch {:>3} - Step {:>3} - Loss: {:.3f}/{:.3f} - Step Time: {:.2f}'.format(epoch, int(step), float(loss), avg_train_loss.result(), step_time))
+                print(
+                    'Epoch {:>3} - Step {:>3} - Loss: {:.3f}/{:.3f} - Loader Time: {:.2} - Step Time: {:.2f}'
+                    .format(epoch, int(step), float(loss),
+                            avg_train_loss.result(), loader_time, step_time))
+                ckpt_manager.save()
+                loader_time = time.time()
 
             # EVAL LOOP
             if FLAGS.dev_files:
                 for step, data in enumerate(dev_set_dist):
                     batch_x, batch_x_lens, batch_y, batch_y_lens = data
-                    eval_loss = distributed_test_step(batch_x, batch_x_lens, batch_y, batch_y_lens)
-                print('Avg. Eval Loss: {:.3f}'.format(avg_eval_loss.result()))
+                    _ = distributed_test_step(batch_x, batch_x_lens, batch_y, batch_y_lens)
+                print('Avg. Eval Loss: {:.3f} - Best Avg. Eval Loss: {:.3f}'.format(avg_eval_loss.result(), best_eval_loss))
+                if avg_eval_loss.result() < best_eval_loss:
+                    best_eval_loss = avg_eval_loss.result()
+                    best_ckpt_manager.save()
 
 
 if __name__ == '__main__':

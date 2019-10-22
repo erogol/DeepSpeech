@@ -105,8 +105,7 @@ def create_dataset(csvs, batch_size, cache_path=''):
                                               output_shapes=([], [None], []))
                               .map(entry_to_features, num_parallel_calls=tf.data.experimental.AUTOTUNE)
                               .cache(cache_path)
-                              .window(batch_size).flat_map(batch_fn)
-                              .prefetch(num_gpus))
+                              .window(batch_size, drop_remainder=True).flat_map(batch_fn))
 
     return dataset
 

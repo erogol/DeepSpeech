@@ -49,28 +49,28 @@ class CreateOverlappingWindows(tf.keras.Model):
                          padding='SAME')
         return self.reshape(x)
 
-# def create_model():
-#     inputs = tf.keras.Input(shape=(None, None, Config.n_input))
+def create_model():
+    inputs = tf.keras.Input(shape=(None, Config.n_input))
 
-#     x = CreateOverlappingWindows()(inputs)
-#     x = layers.Masking()(x)
+    x = CreateOverlappingWindows()(inputs)
+    # x = layers.Masking()(x)
 
-#     x = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
-#     x = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2, FLAGS.relu_clip)(x)
-#     x = DenseDropout(Config.n_hidden_3, FLAGS.dropout_rate3, FLAGS.relu_clip)(x)
-#     # cudnn enabling setting for LSTM
-#     x = keras.layers.LSTM(Config.n_cell_dim, activation='tanh', recurrent_activation='sigmoid', recurrent_dropout=0.0, unroll=False, use_bias=True, return_sequences=True)(x)
+    x = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
+    x = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2, FLAGS.relu_clip)(x)
+    x = DenseDropout(Config.n_hidden_3, FLAGS.dropout_rate3, FLAGS.relu_clip)(x)
+    # cudnn enabling setting for LSTM
+    x = keras.layers.LSTM(Config.n_cell_dim, activation='tanh', recurrent_activation='sigmoid', recurrent_dropout=0.0, unroll=False, use_bias=True, return_sequences=True)(x)
 
-#     x = DenseDropout(Config.n_hidden_5, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
-#     x = layers.Dense(Config.n_hidden_6)(x)
-#     return tf.keras.Model(inputs=inputs, outputs=x, name='DeepSpeechModel')
+    x = DenseDropout(Config.n_hidden_5, FLAGS.dropout_rate, FLAGS.relu_clip)(x)
+    x = layers.Dense(Config.n_hidden_6)(x)
+    return tf.keras.Model(inputs=inputs, outputs=x, name='DeepSpeechModel')
 
 
 class DeepSpeech(keras.Model):
     def __init__(self):
         super(DeepSpeech, self).__init__()
         self.overlap_layer = CreateOverlappingWindows()
-        self.masking = layers.Masking()
+        # self.masking = layers.Masking()
         self.dense1 = DenseDropout(Config.n_hidden_1, FLAGS.dropout_rate,
                                    FLAGS.relu_clip)
         self.dense2 = DenseDropout(Config.n_hidden_2, FLAGS.dropout_rate2,
@@ -91,7 +91,7 @@ class DeepSpeech(keras.Model):
     @tf.function(input_signature=(tf.TensorSpec([None, None, None], dtype=tf.float32), ))
     def call(self, x):
         x = self.overlap_layer(x)
-        x = self.masking(x)
+        # x = self.masking(x)
         x = self.dense1(x)
         x = self.dense2(x)
         x = self.dense3(x)
@@ -106,6 +106,17 @@ def main(_):
     num_gpus = len(gpus)
     print("Using CUDA: ", use_cuda)
     print("Number of GPUs: ", num_gpus)
+    if gpus:
+        try:
+            # Currently, memory growth needs to be the same across GPUs
+            for gpu in gpus:
+                tf.config.experimental.set_memory_growth(gpu, True)
+            logical_gpus = tf.config.experimental.list_logical_devices('GPU')
+            print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+        except RuntimeError as e:
+            # Memory growth must be set before GPUs have been initialized
+            print(e)
+
     initialize_globals()
 
     ####################
@@ -166,15 +177,15 @@ def main(_):
 
     with strategy.scope():
         # primitives
-        model = DeepSpeech()
-        # model = create_model()
+        # model = DeepSpeech()
+        model = create_model()
         optimizer = tf.keras.optimizers.Adam(learning_rate=FLAGS.learning_rate)
 
         # create checkpoint path
         checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train', 'checkpoint')
         ckpt = tf.train.Checkpoint(model=model,
                                    optimizer=optimizer)
-        ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path)
+        ckpt_manager = tf.train.CheckpointManager(ckpt, checkpoint_path, max_to_keep=10)
         best_checkpoint_path = os.path.join(FLAGS.checkpoint_dir, 'train', 'best')
         best_ckpt = tf.train.Checkpoint(model=model,
                                    optimizer=optimizer)
@@ -205,6 +216,7 @@ def main(_):
                                               logits_time_major=False)
                     loss = tf.nn.compute_average_loss(
                         ctc_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+                    loss /= tf.cast(tf.reduce_sum(batch_y_lens), tf.float32)
                 grads = tape.gradient(loss, model.trainable_variables)
                 optimizer.apply_gradients(zip(grads,
                                               model.trainable_variables))
@@ -233,6 +245,7 @@ def main(_):
                                           logits_time_major=False)
                 loss = tf.nn.compute_average_loss(
                     ctc_loss, global_batch_size=GLOBAL_BATCH_SIZE)
+                loss /= tf.cast(tf.reduce_sum(batch_y_lens), tf.float32)
                 return loss
 
             per_replica_loss = strategy.experimental_run_v2(
@@ -259,8 +272,8 @@ def main(_):
                     'Epoch {:>3} - Step {:>3} - Loss: {:.3f}/{:.3f} - Loader Time: {:.2} - Step Time: {:.2f}'
                     .format(epoch, int(step), float(loss),
                             avg_train_loss.result(), loader_time, step_time))
-                ckpt_manager.save()
                 loader_time = time.time()
+            ckpt_manager.save()
 
             # EVAL LOOP
             if FLAGS.dev_files:

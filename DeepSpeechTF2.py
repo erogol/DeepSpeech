@@ -105,7 +105,6 @@ def main(_):
     gpus = tf.config.experimental.list_physical_devices('GPU')
     num_gpus = len(gpus)
     print("Using CUDA: ", use_cuda)
-    print("Number of GPUs: ", num_gpus)
     if gpus:
         try:
             # Currently, memory growth needs to be the same across GPUs
@@ -159,12 +158,12 @@ def main(_):
     # DISTRIBUTED
     #########################
     strategy = tf.distribute.MirroredStrategy()  #devices=["/gpu:0", "/gpu:1"])
-    print('Number of devices in use: {}'.format(strategy.num_replicas_in_sync))
+    print('Number of devices used by MirroredStrategy: {}'.format(strategy.num_replicas_in_sync))
     BATCH_SIZE_PER_REPLICA = FLAGS.train_batch_size
     GLOBAL_BATCH_SIZE = BATCH_SIZE_PER_REPLICA * strategy.num_replicas_in_sync
 
     # create training set
-    train_set = create_dataset(FLAGS.train_files.split(','),
+    train_set, train_set_size = create_dataset(FLAGS.train_files.split(','),
                                batch_size=GLOBAL_BATCH_SIZE,
                                cache_path=FLAGS.feature_cache)
     train_set_dist = strategy.experimental_distribute_dataset(train_set)
@@ -172,7 +171,7 @@ def main(_):
     # create development set
     if FLAGS.dev_files:
         dev_csvs = FLAGS.dev_files.split(',')
-        dev_set = create_dataset(dev_csvs, batch_size=FLAGS.dev_batch_size)
+        dev_set, dev_set_size = create_dataset(dev_csvs, batch_size=FLAGS.dev_batch_size)
         dev_set_dist = strategy.experimental_distribute_dataset(dev_set)
 
     with strategy.scope():
@@ -201,9 +200,8 @@ def main(_):
         avg_eval_loss = keras.metrics.Mean(name='avg_eval_loss')
 
         # https://github.com/tensorflow/tensorflow/issues/29911
-        # @tf.function
-        def distributed_train_step(batch_x, batch_x_lens, batch_y,
-                                   batch_y_lens):
+        @tf.function
+        def distributed_train_step(train_iter):
             def train_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
                 with tf.GradientTape() as tape:
                     logits = model(batch_x, training=True)
@@ -221,10 +219,10 @@ def main(_):
                 optimizer.apply_gradients(zip(grads,
                                               model.trainable_variables))
                 return loss
-
+            data = next(train_iter)
             per_replica_loss = strategy.experimental_run_v2(
                 train_step,
-                args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
+                args=data)
             final_loss = strategy.reduce(tf.distribute.ReduceOp.SUM,
                                          per_replica_loss,
                                          axis=None)
@@ -232,9 +230,8 @@ def main(_):
             return final_loss
 
         # https://github.com/tensorflow/tensorflow/issues/29911
-        # @tf.function
-        def distributed_test_step(batch_x, batch_x_lens, batch_y,
-                                  batch_y_lens):
+        @tf.function
+        def distributed_test_step(dev_iter):
             def eval_step(batch_x, batch_x_lens, batch_y, batch_y_lens):
                 logits = model(batch_x, training=False)
                 ctc_loss = tf.nn.ctc_loss(labels=batch_y,
@@ -247,9 +244,9 @@ def main(_):
                     ctc_loss, global_batch_size=GLOBAL_BATCH_SIZE)
                 loss /= tf.cast(tf.reduce_sum(batch_y_lens), tf.float32)
                 return loss
-
+            data = next(dev_iter)
             per_replica_loss = strategy.experimental_run_v2(
-                eval_step, args=(batch_x, batch_x_lens, batch_y, batch_y_lens))
+                eval_step, args=data)
             final_eval_loss = strategy.reduce(tf.distribute.ReduceOp.SUM,
                                               per_replica_loss,
                                               axis=None)
@@ -258,32 +255,44 @@ def main(_):
 
     with strategy.scope():
         best_eval_loss = float('Inf')
+        n_steps_per_epoch = train_set_size / GLOBAL_BATCH_SIZE
         for epoch in range(FLAGS.epochs):
             # TRAIN LOOP
             loader_time = 0
-            for step, data in enumerate(train_set_dist):
+            step = 0
+            train_set_iter = train_set_dist.make_one_shot_iterator()
+            while True:
                 loader_time = time.time() - loader_time
                 start_time = time.time()
-                batch_x, batch_x_lens, batch_y, batch_y_lens = data
-                loss = distributed_train_step(batch_x, batch_x_lens, batch_y,
-                                              batch_y_lens)
+                try:
+                    loss = distributed_train_step(train_set_iter)
+                except (tf.errors.OutOfRangeError or StopIteration) as e:
+                    break
                 step_time = time.time() - start_time
-                print(
-                    'Epoch {:>3} - Step {:>3} - Loss: {:.3f}/{:.3f} - Loader Time: {:.2} - Step Time: {:.2f}'
-                    .format(epoch, int(step), float(loss),
-                            avg_train_loss.result(), loader_time, step_time))
+                if step % 100 == 0:
+                    print(
+                        'Epoch {:>3} - Step {:>3}/{:} - Loss: {:.3f} ({:.3f}) - Loader Time: {:.2} - Step Time: {:.2f}'
+                        .format(epoch, int(step), int(n_steps_per_epoch), float(loss),
+                                avg_train_loss.result(), loader_time, step_time))
                 loader_time = time.time()
+                step += 1
             ckpt_manager.save()
 
             # EVAL LOOP
             if FLAGS.dev_files:
-                for step, data in enumerate(dev_set_dist):
-                    batch_x, batch_x_lens, batch_y, batch_y_lens = data
-                    _ = distributed_test_step(batch_x, batch_x_lens, batch_y, batch_y_lens)
-                print('Avg. Eval Loss: {:.3f} - Best Avg. Eval Loss: {:.3f}'.format(avg_eval_loss.result(), best_eval_loss))
+                dev_set_iter = train_set_dist.make_one_shot_iterator()
+                step = 0
+                while True:
+                    try:
+                        _ = distributed_test_step(dev_set_iter)
+                    except (tf.errors.OutOfRangeError, StopIteration) as e:
+                        break
+                    step += 1
                 if avg_eval_loss.result() < best_eval_loss:
                     best_eval_loss = avg_eval_loss.result()
                     best_ckpt_manager.save()
+                print('Avg. Eval Loss: {:.3f} - Best Avg. Eval Loss: {:.3f}'.format(avg_eval_loss.result(), best_eval_loss))
+                
 
 
 if __name__ == '__main__':

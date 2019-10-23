@@ -70,6 +70,12 @@ def create_dataset(csvs, batch_size, cache_path=''):
     df = read_csvs(csvs)
     df.sort_values(by='wav_filesize', inplace=True)
 
+    # only keep number of instances multiple of batch size
+    # to fullfill all the GPUs for every iteration
+    upper_limit = df.shape[0] - df.shape[0] % batch_size
+    df = df[: upper_limit]
+    n_instances = df.shape[0]
+
     try:
         # Convert to character index arrays
         df = df.apply(partial(text_to_char_array, alphabet=Config.alphabet), result_type='broadcast', axis=1)
@@ -107,7 +113,7 @@ def create_dataset(csvs, batch_size, cache_path=''):
                               .cache(cache_path)
                               .window(batch_size, drop_remainder=True).flat_map(batch_fn))
 
-    return dataset
+    return dataset, n_instances
 
 def secs_to_hours(secs):
     hours, remainder = divmod(secs, 3600)
